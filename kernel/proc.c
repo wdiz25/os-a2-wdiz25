@@ -124,6 +124,11 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = ticks;
+  p->level = 0;
+  p->ticksused = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -167,6 +172,11 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = 0;
+  p->level = 0;
+  p->ticksused = 0;
   p->state = UNUSED;
 }
 
@@ -449,6 +459,7 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
+        p->nsched++;
         c->proc = p;
         swtch(&c->context, &p->context);
 
@@ -505,6 +516,18 @@ yield(void)
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
+}
+
+// Called on every timer interrupt by the CPU that took it, with p the
+// process it was running. Charges the tick to p and returns 1 if p
+// should give up the CPU.
+int
+mlfq_tick(struct proc *p)
+{
+  acquire(&p->lock);
+  p->runticks++;
+  release(&p->lock);
+  return 1;
 }
 
 // A fork child's very first scheduling by scheduler()
