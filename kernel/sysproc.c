@@ -110,3 +110,16 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// copy scheduling stats for up to max processes
+// into the user array of struct pinfo at buf.
+uint64
+sys_getpinfo(void)
+{
+  uint64 buf;
+  int max;
+
+  argaddr(0, &buf);
+  argint(1, &max);
+  return kgetpinfo(buf, max);
+}

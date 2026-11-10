@@ -4,6 +4,7 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "pinfo.h"
 #include "defs.h"
 
 struct cpu cpus[NCPU];
@@ -691,6 +692,46 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
     memmove(dst, (char *)src, len);
     return 0;
   }
+}
+
+// Copy a struct pinfo for each process that is not UNUSED, in proc[]
+// order, to the user array at addr, stopping after max entries.
+// Each entry is filled under p->lock, then copied out after release.
+// Returns the number copied, or -1 if max < 0 or a copy fails.
+int
+kgetpinfo(uint64 addr, int max)
+{
+  struct proc *me = myproc();
+  struct proc *p;
+  struct pinfo info;
+  int n = 0;
+
+  if (max < 0)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC] && n < max; p++) {
+    acquire(&p->lock);
+    if (p->state == UNUSED) {
+      release(&p->lock);
+      continue;
+    }
+    // zero first so no stale kernel stack bytes reach user space.
+    memset(&info, 0, sizeof(info));
+    info.pid = p->pid;
+    info.state = p->state;
+    info.level = p->level;
+    info.runticks = p->runticks;
+    info.nsched = p->nsched;
+    info.ctime = p->ctime;
+    safestrcpy(info.name, p->name, sizeof(info.name));
+    release(&p->lock);
+
+    if (copyout(me->pagetable, me->sz, addr + n * sizeof(info),
+                (char *)&info, sizeof(info)) < 0)
+      return -1;
+    n++;
+  }
+  return n;
 }
 
 // Print a process listing to console.  For debugging.
