@@ -106,7 +106,7 @@ test_demote(void)
       if (me.level != expected_level(me.runticks)) {
         printf("demote: level %d after %d ticks, expected %d\n", me.level,
                me.runticks, expected_level(me.runticks));
-        fail("demote: wrong level (time forgiven on sleep?)");
+        fail("demote: level does not match ticks used");
       }
       // sleep partway through slices at 2, 4, 6, ... ticks used.
       if (me.runticks >= target) {
@@ -121,6 +121,38 @@ test_demote(void)
   }
   wait_ok();
   printf("demote: ok\n");
+}
+
+// Rules 5 and 7: a process alone at the lowest level keeps the CPU
+// for its whole 8-tick slice, instead of yielding on every tick.
+void
+test_slice(void)
+{
+  sync_boost();
+  int pid = fork();
+  if (pid < 0)
+    fail("fork");
+  if (pid == 0) {
+    int window = uptime() / BOOSTTICKS;
+    struct pinfo start, me;
+    // the demotion into the lowest level starts a fresh slice.
+    do {
+      start = self();
+    } while (start.level != NLEVEL - 1);
+    do {
+      me = self();
+    } while (me.runticks < start.runticks + 40);
+
+    int switches = me.nsched - start.nsched;
+    printf("slice: %d switches in 40 ticks at the lowest level\n", switches);
+    if (uptime() / BOOSTTICKS != window)
+      fail("slice: a boost happened mid-test; rerun");
+    if (switches < 4 || switches > 6)
+      fail("slice: lowest level should yield once per 8 ticks");
+    exit(0);
+  }
+  wait_ok();
+  printf("slice: ok\n");
 }
 
 // Rules 1 and 7: a level-3 spinner is preempted as soon as a
@@ -180,6 +212,57 @@ test_priority(void)
   if (uptime() / BOOSTTICKS != window)
     fail("priority: a boost happened mid-test; rerun");
   printf("priority: ok\n");
+}
+
+// Rule 2: processes at the same level take turns, so each gets a
+// fair share instead of the first one in proc[] keeping the CPU.
+void
+test_fair(void)
+{
+  int pids[3];
+  struct pinfo s0[3], s1[3];
+  int i, all;
+
+  sync_boost();
+  int window = uptime() / BOOSTTICKS;
+  for (i = 0; i < 3; i++) {
+    pids[i] = fork();
+    if (pids[i] < 0)
+      fail("fork");
+    if (pids[i] == 0)
+      for (;;)
+        ;
+  }
+
+  // wait until all three spinners have sunk to the lowest level.
+  do {
+    pause(1);
+    all = 1;
+    for (i = 0; i < 3; i++) {
+      lookup(pids[i], &s0[i]);
+      if (s0[i].level != NLEVEL - 1)
+        all = 0;
+    }
+  } while (!all);
+
+  pause(24);
+  for (i = 0; i < 3; i++)
+    lookup(pids[i], &s1[i]);
+  for (i = 0; i < 3; i++)
+    kill(pids[i]);
+  for (i = 0; i < 3; i++)
+    wait(0);
+
+  printf("fair: shares of 24 ticks: %d %d %d\n", s1[0].runticks - s0[0].runticks,
+         s1[1].runticks - s0[1].runticks, s1[2].runticks - s0[2].runticks);
+  if (uptime() / BOOSTTICKS != window)
+    fail("fair: a boost happened mid-test; rerun");
+  for (i = 0; i < 3; i++) {
+    int share = s1[i].runticks - s0[i].runticks;
+    if (share < 4 || share > 12)
+      fail("fair: same-level processes should share the CPU");
+  }
+  printf("fair: ok\n");
 }
 
 // Rule 8: a process at the lowest level is moved back up when
@@ -266,7 +349,9 @@ main(int argc, char *argv[])
     test_stress();
   } else {
     test_demote();
+    test_slice();
     test_priority();
+    test_fair();
     test_boost();
     test_stress();
   }
