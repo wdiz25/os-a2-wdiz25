@@ -170,6 +170,8 @@ clockintr()
     acquire(&tickslock);
     ticks++;
     wakeup(&ticks);
+    if (ticks % BOOSTTICKS == 0)
+      mlfq_boost();
     release(&tickslock);
   }
 

@@ -101,6 +101,7 @@ int             kwait(uint64);
 void            wakeup(void*);
 void            yield(void);
 int             mlfq_tick(struct proc*);
+void            mlfq_boost(void);
 int             kgetpinfo(uint64, int);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);

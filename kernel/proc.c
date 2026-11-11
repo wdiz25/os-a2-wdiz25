@@ -429,10 +429,41 @@ kwait(uint64 addr)
   }
 }
 
+// For each MLFQ level, the proc[] slot just after the one most
+// recently chosen from that level: where the next scan starts.
+// Shared by all CPUs; a racy update only changes who runs next.
+static int mlfq_next[NLEVEL];
+
+// Choose the next process to run: the first RUNNABLE one, in proc[]
+// order from the level's cursor, at the highest level that has one.
+// Holds one p->lock at a time while scanning. Returns the chosen
+// process with its lock held, or 0 if nothing is RUNNABLE.
+static struct proc *
+mlfq_pick(void)
+{
+  struct proc *p;
+  int level, start, i, slot;
+
+  for (level = 0; level < NLEVEL; level++) {
+    start = mlfq_next[level];
+    for (i = 0; i < NPROC; i++) {
+      slot = (start + i) % NPROC;
+      p = &proc[slot];
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && p->level == level) {
+        mlfq_next[level] = (slot + 1) % NPROC;
+        return p;
+      }
+      release(&p->lock);
+    }
+  }
+  return 0;
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
+//  - choose a process to run, using the MLFQ rules.
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
@@ -452,32 +483,29 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        p->nsched++;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
-    }
-    if (found == 0) {
+    p = mlfq_pick();
+    if (p == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
+      continue;
     }
+
+    // Switch to chosen process.  Its lock is still held from
+    // mlfq_pick(), so it is still RUNNABLE.  It is the process's
+    // job to release its lock and then reacquire it
+    // before jumping back to us.
+    p->state = RUNNING;
+    p->nsched++;
+    c->proc = p;
+    swtch(&c->context, &p->context);
+
+    // Don't re-enable interrupts on release.
+    mycpu()->intena = 0;
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->proc = 0;
+    release(&p->lock);
   }
 }
 
@@ -519,16 +547,73 @@ yield(void)
   release(&p->lock);
 }
 
+// Time slice, in ticks, for each MLFQ level.
+static int mlfq_slice[NLEVEL] = { 1, 2, 4, 8 };
+
+// Return 1 if a process other than me is RUNNABLE at a level
+// higher (numerically lower) than level. Takes each p->lock in
+// turn, so the caller must not hold any p->lock.
+static int
+higher_runnable(struct proc *me, int level)
+{
+  struct proc *p;
+  int found;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    if (p == me)
+      continue;
+    acquire(&p->lock);
+    found = p->state == RUNNABLE && p->level < level;
+    release(&p->lock);
+    if (found)
+      return 1;
+  }
+  return 0;
+}
+
 // Called on every timer interrupt by the CPU that took it, with p the
 // process it was running. Charges the tick to p and returns 1 if p
 // should give up the CPU.
 int
 mlfq_tick(struct proc *p)
 {
+  int level;
+
   acquire(&p->lock);
   p->runticks++;
+  p->ticksused++;
+  if (p->ticksused >= mlfq_slice[p->level]) {
+    // slice used up: move down a level (the lowest stays put),
+    // start a fresh slice there, and yield.
+    if (p->level < NLEVEL - 1)
+      p->level++;
+    p->ticksused = 0;
+    release(&p->lock);
+    return 1;
+  }
+  level = p->level;
   release(&p->lock);
-  return 1;
+
+  // slice not used up: keep running unless a higher level has work.
+  // p->lock is released first, since higher_runnable() takes others'.
+  return level > 0 && higher_runnable(p, level);
+}
+
+// Move every process to MLFQ level 0 with a fresh slice, so that
+// nothing starves at a low level. Called by clockintr() on CPU 0
+// with tickslock held; taking each p->lock after it, one at a time,
+// matches the kernel's lock order.
+void
+mlfq_boost(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    p->level = 0;
+    p->ticksused = 0;
+    release(&p->lock);
+  }
 }
 
 // A fork child's very first scheduling by scheduler()
